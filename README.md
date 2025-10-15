@@ -18,24 +18,6 @@ Make sure these repositories are cloned to the correct paths referenced in `Carg
 - `l0 = { path = "../l0" }`
 - `zk = { path = "../zk" }`
 
-### 2. Build and Install wallet_prover
-
-```bash
-# Clone wallet_prover
-git clone https://github.com/theparadigmshifters/wallet_prover.git
-cd wallet_prover
-
-# Build
-go mod tidy
-go build
-
-# Install to system path
-sudo cp wallet_prover /usr/local/bin/
-
-# Verify installation
-which wallet_prover
-```
-
 ## Building the Wallet
 
 ```bash

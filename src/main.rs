@@ -8,6 +8,8 @@ use l0::{Tx, Out, Wp, AsBytes};
 use zk::{Fr, Vk, Proof, ToHash, Inputs, AsNum};
 use ark_std::UniformRand;
 
+mod wallet_prover_ffi;
+
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
 struct Cli {
@@ -189,7 +191,6 @@ trait HexConverter {
 impl HexConverter for Fr {
     fn to_hex(&self) -> String {
         let bytes: Vec<u8> = self.clone().enc().collect();
-        // Pad to 32 bytes if needed
         let mut padded = vec![0u8; 32usize.saturating_sub(bytes.len())];
         padded.extend_from_slice(&bytes);
         hex::encode(padded)
@@ -201,97 +202,28 @@ impl HexConverter for Fr {
     }
 }
 
-async fn generate_address(secret: Fr) -> Result<String> {
+fn generate_address(secret: Fr) -> Result<String> {
     let secret_hex = secret.to_hex();
-    
-    let output = tokio::process::Command::new("wallet_prover")
-        .arg(&secret_hex)
-        .output()
-        .await?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!("wallet_prover failed: {}", stderr));
-    }
-
-    let addr_hex = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    Ok(addr_hex)
+    wallet_prover_ffi::generate_address(&secret_hex)
 }
 
-async fn get_hash_wallet_vk() -> Result<Vk> {
-    // Try to get VK from a helper tool
-    let output = tokio::process::Command::new("hash_wallet_vk")
-        .output()
-        .await?;
-    
-    if !output.status.success() {
-        return Err(anyhow!("Failed to get VK. Please create a 'hash_wallet_vk' tool that outputs the hex-encoded VK."));
-    }
-    
-    let vk_hex = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let vk_bytes = hex::decode(&vk_hex)?;
-    Vk::dec(&mut vk_bytes.into_iter())
-}
-
-async fn generate_proof(secret: Fr, public_inputs: &[Fr]) -> Result<(String, String, String)> {
+fn generate_proof(secret: Fr, public_inputs: &[Fr]) -> Result<(String, String, String)> {
     let secret_hex = secret.to_hex();
-    let pis = public_inputs.iter()
-        .map(|v| v.to_hex())
-        .collect::<Vec<_>>()
-        .join(",");
+    let x_hex = public_inputs[0].to_hex();
+    let y_hex = public_inputs[1].to_hex();
+    let z_hex = public_inputs[2].to_hex();
+    let w_hex = public_inputs[3].to_hex();
     
-    let arg = format!("{},{}", secret_hex, pis);
-    
-    let output = tokio::process::Command::new("wallet_prover")
-        .arg(&arg)
-        .output()
-        .await?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!("wallet_prover failed: {}", stderr));
-    }
-
-    let result = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    
-    let parts: Vec<&str> = result.split(',').collect();
-    if parts.len() == 3 {
-        Ok((parts[0].to_string(), parts[1].to_string(), parts[2].to_string()))
-    } else {
-        Err(anyhow!("Invalid proof output format, expected: proof,vk,address"))
-    }
+    wallet_prover_ffi::generate_proof_hash_wallet(&secret_hex, &x_hex, &y_hex, &z_hex, &w_hex)
 }
 
-async fn generate_proof_permissionless(public_inputs: &[Fr]) -> Result<(String, String, String)> {
-    let pis = public_inputs.iter()
-        .map(|v| v.to_hex())
-        .collect::<Vec<_>>()
-        .join(",");
+fn generate_proof_permissionless(public_inputs: &[Fr]) -> Result<(String, String, String)> {
+    let x_hex = public_inputs[0].to_hex();
+    let y_hex = public_inputs[1].to_hex();
+    let z_hex = public_inputs[2].to_hex();
+    let w_hex = public_inputs[3].to_hex();
     
-    let output = tokio::process::Command::new("wallet_prover")
-        .arg(&pis)
-        .output()
-        .await?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!("wallet_prover failed: {}", stderr));
-    }
-
-    let result = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    
-    let parts: Vec<&str> = result.split(',').collect();
-    if parts.len() == 3 {
-        Ok((parts[0].to_string(), parts[1].to_string(), parts[2].to_string()))
-    } else {
-        Err(anyhow!("Invalid proof output format, expected: proof,vk,address"))
-    }
-}
-
-fn compute_vk_hash(vk_hex: &str) -> Result<Fr> {
-    let bytes = hex::decode(vk_hex)?;
-    let vk = Vk::dec(&mut bytes.into_iter())?;
-    Ok(vk.hash())
+    wallet_prover_ffi::generate_proof_permissionless(&x_hex, &y_hex, &z_hex, &w_hex)
 }
 
 fn decode_utxo(utxo_hex: &str) -> Result<Out> {
@@ -309,7 +241,6 @@ fn select_utxos(utxos: Vec<(Fr, Out)>, amount: Fr) -> Option<((Fr, Out), (Fr, Ou
         return None;
     }
     
-    // Need to cover amount + fee (fee = 3)
     let fee = Fr::from(3u32);
     let required = amount + fee;
     
@@ -341,11 +272,9 @@ fn construct_transfer_tx(
 ) -> Tx {
     let total_input = input1.1.amount + input2.1.amount;
     
-    // Fee = 3 (difference between input and output)
     let fee = Fr::from(3u32);
     let change = total_input - amount - fee;
     
-    // Add 3 data elements to ox for storage cost (price=1, so 3*1=3)
     let fee_data = vec![Fr::from(0u32), Fr::from(0u32), Fr::from(0u32)];
     
     Tx {
@@ -378,7 +307,7 @@ async fn main() -> Result<()> {
             let secret = Fr::rand(&mut OsRng);
             println!("Secret: {}", secret.to_hex());
             
-            match generate_address(secret).await {
+            match generate_address(secret) {
                 Ok(vk_hex) => {
                     println!("Account (VK): {}", vk_hex);
                 }
@@ -405,7 +334,7 @@ async fn main() -> Result<()> {
         Commands::ListUtxos { account } => {
             println!("Listing UTXOs for account: {}", account);
             
-            let mut last_utxo_id = "0000000000000000000000000000000000000000000000000000000000000003".to_string();
+            let mut last_utxo_id = "0000000000000000000000000000000000000000000000000000000000000000".to_string();
             let mut total_utxos = 0;
             
             loop {
@@ -450,9 +379,8 @@ async fn main() -> Result<()> {
             let to_fr = HexConverter::from_hex(to.clone())?;
             let secret_fr = HexConverter::from_hex(secret.clone())?;
             
-            // Step 1: Get UTXO IDs by calling get_next_id_of_utxo_by_owner repeatedly
             let mut utxo_ids = Vec::new();
-            let mut current_id = Fr::from(8u64); // Start from a known starting point
+            let mut current_id = Fr::from(8u64);
             
             for _ in 0..100 {
                 let id_hex = current_id.to_hex();
@@ -475,7 +403,6 @@ async fn main() -> Result<()> {
             
             println!("Found {} UTXO IDs", utxo_ids.len());
             
-            // Step 2: Fetch actual UTXOs for these IDs
             let mut all_utxos = Vec::new();
             for utxo_id in utxo_ids {
                 let utxo_id_hex = utxo_id.to_hex();
@@ -505,8 +432,7 @@ async fn main() -> Result<()> {
                 println!("Selected UTXO 2: amount = {}", selected.1.1.amount.to_hex());
             }
             
-            // Generate address from secret
-            let from_address_hex = generate_address(secret_fr).await?;
+            let from_address_hex = generate_address(secret_fr)?;
             let addr_bytes = hex::decode(&from_address_hex)?;
             let from_address = Fr::dec(&mut addr_bytes.into_iter())?;
             
@@ -524,12 +450,11 @@ async fn main() -> Result<()> {
             let inputs: Inputs = tx.clone().into();
             let input_array: [Fr; 4] = inputs.into();
             
-            match generate_proof(secret_fr, &input_array).await {
+            match generate_proof(secret_fr, &input_array) {
                 Ok((proof_hex, vk_hex, addr_hex)) => {
                     println!("Proof generated successfully");
                     println!("Address: {}", addr_hex);
                     
-                    // Verify address matches
                     let addr_bytes = hex::decode(&addr_hex)?;
                     let addr = Fr::dec(&mut addr_bytes.into_iter())?;
                     if addr != from_address {
@@ -540,7 +465,6 @@ async fn main() -> Result<()> {
                     let proof_bytes = hex::decode(proof_hex)?;
                     let proof = Proof::dec(&mut proof_bytes.into_iter())?;
                     
-                    // Use VK from proof generation (guaranteed to match)
                     let vk_bytes = hex::decode(&vk_hex)?;
                     let vk = Vk::dec(&mut vk_bytes.into_iter())?;
                     
@@ -580,9 +504,8 @@ async fn main() -> Result<()> {
             
             println!("\n[1/5] Fetching UTXOs...");
             
-            // Step 1: Get UTXO IDs by calling get_next_id_of_utxo_by_owner repeatedly
             let mut utxo_ids = Vec::new();
-            let mut current_id = Fr::from(8u64); // Start from a known starting point
+            let mut current_id = Fr::from(8u64);
             
             for _ in 0..100 {
                 let id_hex = current_id.to_hex();
@@ -605,7 +528,6 @@ async fn main() -> Result<()> {
             
             println!("Found {} UTXO IDs", utxo_ids.len());
             
-            // Step 2: Fetch actual UTXOs for these IDs
             let mut all_utxos = Vec::new();
             for utxo_id in utxo_ids {
                 let utxo_id_hex = utxo_id.to_hex();
@@ -649,7 +571,7 @@ async fn main() -> Result<()> {
             let inputs: Inputs = tx.clone().into();
             let input_array: [Fr; 4] = inputs.into();
             
-            match generate_proof_permissionless(&input_array).await {
+            match generate_proof_permissionless(&input_array) {
                 Ok((proof_hex, vk_hex, addr_hex)) => {
                     println!("Proof generated successfully");
                     println!("Address: {}", addr_hex);
@@ -665,7 +587,6 @@ async fn main() -> Result<()> {
                     
                     let proof = Proof::dec(&mut proof_bytes.into_iter())?;
                     
-                    // Use VK from proof generation (guaranteed to match)
                     let vk_bytes = hex::decode(&vk_hex)?;
                     let vk = Vk::dec(&mut vk_bytes.into_iter())?;
                     
